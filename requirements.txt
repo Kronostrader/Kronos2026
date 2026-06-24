@@ -1,1 +1,5 @@
-requests
+ccxt
+pandas
+numpy
+scikit-learn
+ta
