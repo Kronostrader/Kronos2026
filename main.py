@@ -1,26 +1,29 @@
-"""BTC 5-minute candle probability predictor
+"""BTC 5-minute candle probability predictor with training & backtest
 
-Heuristic/probabilistic bot using ccxt to fetch market data (candles, orderbook, trades)
-and combining technical indicators + orderflow imbalance to output a probability that
-the next 5-minute BTC/USDT candle will close green.
+This updated main.py adds:
+ - A simple training pipeline that fits a logistic regression (numpy GD) on historical
+   OHLCV-derived features and persists the model and scaler to disk (model.npz).
+ - A backtest mode that evaluates the trained model on a held-out slice and reports
+   accuracy and simple metrics.
+ - Improved trade side detection using orderbook mid-price when trade side isn't provided.
+ - CSV logging of live predictions to predictions.csv for future analysis.
+ - CLI interface: --train, --backtest, --live (default).
 
-Usage:
-  - Install dependencies: pip install ccxt pandas numpy
-  - Set environment variables to choose exchange/symbol if desired:
-      EXCHANGE (default: "binance")
-      SYMBOL (default: "BTC/USDT")
-  - Run: python main.py
-
-Notes:
-  - This is an interpretable heuristic model (sigmoid of weighted features).
-  - Weights are heuristics and should be trained/tuned with historical labeled data
-    for better probabilities.
-  - Watch out for exchange rate limits; adjust fetch intervals if you hit limits.
+Notes & caveats:
+ - Historical orderbook snapshots aren't generally available via public exchange APIs,
+   so training uses only OHLCV-derived features; orderbook/trade features are set to 0
+   during training. Live predictions will use orderbook/trade features if available.
+ - This uses a simple logistic regression trained with gradient descent in numpy to avoid
+   heavyweight dependencies. For best results, consider using scikit-learn/XGBoost and
+   a more extensive labeled dataset.
+ - Always backtest thoroughly before using predictions for trading.
 """
 
 import os
 import time
 import math
+import json
+import argparse
 import ccxt
 import numpy as np
 import pandas as pd
@@ -30,14 +33,15 @@ from datetime import datetime, timezone
 EXCHANGE_NAME = os.getenv("EXCHANGE", "binance")
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 TIMEFRAME = '5m'
-OHLCV_LIMIT = 200
-ORDERBOOK_DEPTH = 20
+OHLCV_LIMIT = 2000  # increase for training/backtesting
+ORDERBOOK_DEPTH = 30
 TRADE_LOOKBACK_SECONDS = 60 * 3  # last 3 minutes of trades for orderflow
+MODEL_PATH = 'model.npz'
+PREDICTION_LOG = 'predictions.csv'
 
-# Heuristic model weights (feature order described in compute_features)
-# These are starting heuristics. Consider training these using historical labels.
-WEIGHTS = np.array([0.6, 0.8, 0.4, 0.3, 1.2, 1.0, 1.5])
-BIAS = -0.05
+# Default heuristic weights (used if no trained model found)
+DEFAULT_WEIGHTS = np.array([0.6, 0.8, 0.4, 0.3, 1.2, 1.0, 1.5])
+DEFAULT_BIAS = -0.05
 
 
 def sigmoid(x):
@@ -58,11 +62,18 @@ def rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def atr(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
 def open_exchange(name: str):
     exchange_cls = getattr(ccxt, name)
     exchange = exchange_cls({
         'enableRateLimit': True,
-        # add API keys in environment if you want private endpoints (not needed here)
     })
     return exchange
 
@@ -71,12 +82,16 @@ def fetch_ohlcv(exchange, symbol, timeframe=TIMEFRAME, limit=OHLCV_LIMIT):
     data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
     df['datetime'] = pd.to_datetime(df['ts'], unit='ms')
+    df = df.reset_index(drop=True)
     return df
 
 
 def fetch_orderbook(exchange, symbol, depth=ORDERBOOK_DEPTH):
-    ob = exchange.fetch_order_book(symbol, depth)
-    return ob
+    try:
+        ob = exchange.fetch_order_book(symbol, depth)
+        return ob
+    except Exception:
+        return {'bids': [], 'asks': []}
 
 
 def fetch_recent_trades(exchange, symbol, since=None, limit=1000):
@@ -84,95 +99,244 @@ def fetch_recent_trades(exchange, symbol, since=None, limit=1000):
         trades = exchange.fetch_trades(symbol, since=since, limit=limit)
         return trades
     except Exception:
-        # Not all exchanges support since/limit similarly; fallback
-        return exchange.fetch_trades(symbol, limit=limit)
+        try:
+            return exchange.fetch_trades(symbol, limit=limit)
+        except Exception:
+            return []
 
 
-def orderbook_imbalance(orderbook):
+def orderbook_imbalance(orderbook, depths=(5, 10, 20)):
+    # compute imbalance at multiple depths and return a small vector (averaged)
     bids = orderbook.get('bids', [])
     asks = orderbook.get('asks', [])
-    bid_vol = sum([b[1] for b in bids[:ORDERBOOK_DEPTH]])
-    ask_vol = sum([a[1] for a in asks[:ORDERBOOK_DEPTH]])
-    if bid_vol + ask_vol == 0:
-        return 0.0
-    return (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    results = []
+    for d in depths:
+        bid_vol = sum([b[1] for b in bids[:d]])
+        ask_vol = sum([a[1] for a in asks[:d]])
+        if bid_vol + ask_vol == 0:
+            results.append(0.0)
+        else:
+            results.append((bid_vol - ask_vol) / (bid_vol + ask_vol))
+    # return a single scalar collapsed (weighted) for the live feature
+    return float(np.mean(results))
 
 
-def trade_imbalance(trades):
-    # trades are dicts with amount and side (maybe 'side' or 'takerSide' depending on exchange)
+def trade_imbalance(trades, orderbook=None):
     buy_vol = 0.0
     sell_vol = 0.0
+    mid = None
+    if orderbook and orderbook.get('bids') and orderbook.get('asks'):
+        best_bid = orderbook['bids'][0][0]
+        best_ask = orderbook['asks'][0][0]
+        mid = (best_bid + best_ask) / 2.0
+
     for t in trades:
         amount = float(t.get('amount', t.get('size', 0) or 0))
-        # guess side
-        side = t.get('side') or t.get('takerSide') or t.get('maker')
-        # normalize side detection
-        if side in ('buy', 'Buy', 'b', 'taker', 'buy_market'):
+        price = t.get('price') or t.get('priceUsd') or None
+        side = t.get('side') or t.get('takerSide') or None
+
+        if not side:
+            # infer from price vs mid if possible
+            if price is not None and mid is not None:
+                try:
+                    p = float(price)
+                    side = 'buy' if p >= mid else 'sell'
+                except Exception:
+                    side = None
+
+        if side in ('buy', 'Buy', 'b', 'taker'):
             buy_vol += amount
-        elif side in ('sell', 'Sell', 's', 'maker', 'sell_market'):
+        elif side in ('sell', 'Sell', 's', 'maker'):
             sell_vol += amount
         else:
-            # Some exchanges don't provide side; use price vs market-ask/bid heuristic if available
-            # fallback: ignore
+            # ignore
             pass
+
     if buy_vol + sell_vol == 0:
         return 0.0
     return (buy_vol - sell_vol) / (buy_vol + sell_vol)
 
 
-def compute_features(df, orderbook, trades):
-    # df is ohlcv with latest at the bottom
+def compute_features(df, orderbook=None, trades=None):
+    # Build the same 7 features as before; if orderbook/trades unavailable, those are 0
     features = []
 
-    # 1) last 5m return
+    # last 5m return
     last_return = (df['close'].iloc[-1] - df['open'].iloc[-1]) / (df['open'].iloc[-1] + 1e-12)
     features.append(last_return)
 
-    # 2) short-term momentum: return of last 3 candles
-    recent_return = (df['close'].iloc[-1] - df['close'].iloc[-4]) / (df['close'].iloc[-4] + 1e-12)
+    # short-term momentum: return of last 3 candles
+    idx = len(df) - 1
+    prev_idx = max(0, idx - 3)
+    recent_return = (df['close'].iloc[idx] - df['close'].iloc[prev_idx]) / (df['close'].iloc[prev_idx] + 1e-12)
     features.append(recent_return)
 
-    # 3) EMA slope (10 vs 30) of close
+    # EMA slope (10 vs 30) of close
     e10 = ema(df['close'], span=10)
     e30 = ema(df['close'], span=30)
     ema_slope = (e10.iloc[-1] - e30.iloc[-1]) / (df['close'].iloc[-1] + 1e-12)
     features.append(ema_slope)
 
-    # 4) RSI on closes (14)
+    # RSI on closes (14)
     r = rsi(df['close'], period=14)
-    rsi_last = (r.iloc[-1] - 50) / 50.0  # normalized around 0
+    rsi_last = (r.iloc[-1] - 50) / 50.0
     features.append(rsi_last)
 
-    # 5) orderbook imbalance (bids vs asks)
-    ob_imb = orderbook_imbalance(orderbook)
+    # orderbook imbalance
+    ob_imb = 0.0
+    if orderbook:
+        ob_imb = orderbook_imbalance(orderbook)
     features.append(ob_imb)
 
-    # 6) recent trade imbalance
-    trade_imb = trade_imbalance(trades)
-    features.append(trade_imb)
+    # trade imbalance
+    t_imb = 0.0
+    if trades:
+        t_imb = trade_imbalance(trades, orderbook=orderbook)
+    features.append(t_imb)
 
-    # 7) volume spike: last candle volume vs median of previous N
-    med_vol = np.median(df['volume'].iloc[-20:-1]) if len(df) > 21 else np.median(df['volume'].iloc[:-1]) if len(df) > 2 else df['volume'].iloc[-1]
+    # volume spike
+    med_vol = np.median(df['volume'].iloc[-21:-1]) if len(df) > 21 else np.median(df['volume'].iloc[:-1]) if len(df) > 2 else df['volume'].iloc[-1]
     vol_spike = (df['volume'].iloc[-1] - med_vol) / (med_vol + 1e-12)
     features.append(vol_spike)
 
     return np.array(features, dtype=float)
 
 
-def predict_probability(features, weights=WEIGHTS, bias=BIAS):
-    # simple linear + sigmoid
-    score = np.dot(weights, features) + bias
-    prob = sigmoid(score)
-    return float(prob), float(score)
+def predict_probability(features, model=None):
+    # model: dict with weights, bias, mean, std
+    if model is None:
+        # fallback to heuristic
+        w = DEFAULT_WEIGHTS
+        b = DEFAULT_BIAS
+        score = float(np.dot(w, features) + b)
+        return float(sigmoid(score)), score
+
+    mean = model['mean']
+    std = model['std']
+    w = model['weights']
+    b = model['bias']
+
+    # ensure same feature length
+    x = (features - mean) / (std + 1e-12)
+    score = float(np.dot(w, x) + b)
+    return float(sigmoid(score)), score
+
+
+def save_model(weights, bias, mean, std, path=MODEL_PATH):
+    np.savez(path, weights=weights, bias=bias, mean=mean, std=std)
+
+
+def load_model(path=MODEL_PATH):
+    if not os.path.exists(path):
+        return None
+    npz = np.load(path)
+    return {
+        'weights': npz['weights'],
+        'bias': float(npz['bias']),
+        'mean': npz['mean'],
+        'std': npz['std']
+    }
+
+
+def build_dataset_from_ohlcv(df):
+    # df must be reasonably long. We'll generate one sample per candle excluding the last one
+    rows = []
+    for i in range(30, len(df) - 1):
+        window = df.iloc[:i+1].copy()
+        # compute features up to index i
+        f = []
+        last_return = (window['close'].iloc[-1] - window['open'].iloc[-1]) / (window['open'].iloc[-1] + 1e-12)
+        f.append(last_return)
+        prev_idx = max(0, len(window) - 4)
+        recent_return = (window['close'].iloc[-1] - window['close'].iloc[prev_idx]) / (window['close'].iloc[prev_idx] + 1e-12)
+        f.append(recent_return)
+        e10 = ema(window['close'], span=10)
+        e30 = ema(window['close'], span=30)
+        ema_slope = (e10.iloc[-1] - e30.iloc[-1]) / (window['close'].iloc[-1] + 1e-12)
+        f.append(ema_slope)
+        r = rsi(window['close'], period=14)
+        rsi_last = (r.iloc[-1] - 50) / 50.0
+        f.append(rsi_last)
+        # orderbook/trade features not available historically -> 0
+        f.append(0.0)
+        f.append(0.0)
+        med_vol = np.median(window['volume'].iloc[-21:-1]) if len(window) > 21 else np.median(window['volume'].iloc[:-1]) if len(window) > 2 else window['volume'].iloc[-1]
+        vol_spike = (window['volume'].iloc[-1] - med_vol) / (med_vol + 1e-12)
+        f.append(vol_spike)
+
+        # target is whether next candle closed green
+        next_open = df['open'].iloc[i+1]
+        next_close = df['close'].iloc[i+1]
+        y = 1 if next_close > next_open else 0
+
+        rows.append((f, y))
+
+    X = np.array([r[0] for r in rows], dtype=float)
+    y = np.array([r[1] for r in rows], dtype=int)
+    return X, y
+
+
+def train_logistic_gd(X, y, epochs=2000, lr=0.1, l2=1e-4, verbose=True):
+    n, d = X.shape
+    # standardize
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    Xs = (X - mean) / (std + 1e-12)
+
+    # init
+    w = np.zeros(d)
+    b = 0.0
+
+    for epoch in range(epochs):
+        z = Xs.dot(w) + b
+        p = sigmoid(z)
+        # gradients
+        error = p - y
+        gw = (Xs.T.dot(error) / n) + l2 * w
+        gb = error.mean()
+        w -= lr * gw
+        b -= lr * gb
+
+        if verbose and (epoch % 200 == 0 or epoch == epochs - 1):
+            loss = -np.mean(y * np.log(p + 1e-12) + (1 - y) * np.log(1 - p + 1e-12)) + (l2 / 2) * np.sum(w * w)
+            print(f"Epoch {epoch}/{epochs} loss={loss:.6f}")
+
+    return w, b, mean, std
+
+
+def backtest_model(model, X, y):
+    mean = model['mean']
+    std = model['std']
+    w = model['weights']
+    b = model['bias']
+    Xs = (X - mean) / (std + 1e-12)
+    probs = sigmoid(Xs.dot(w) + b)
+    preds = (probs >= 0.5).astype(int)
+
+    acc = (preds == y).mean()
+    tp = ((preds == 1) & (y == 1)).sum()
+    fp = ((preds == 1) & (y == 0)).sum()
+    fn = ((preds == 0) & (y == 1)).sum()
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    print(f"Backtest samples: {len(y)} accuracy={acc:.4f} precision={precision:.4f} recall={recall:.4f}")
+
+
+def log_prediction(timestamp, features, prob, model_name='trained'):
+    cols = ['ts', 'model', 'prob'] + [f'f{i}' for i in range(len(features))]
+    row = [timestamp.isoformat(), model_name, f"{prob:.6f}"] + [f"{v:.6f}" for v in features]
+    write_header = not os.path.exists(PREDICTION_LOG)
+    with open(PREDICTION_LOG, 'a') as f:
+        if write_header:
+            f.write(','.join(cols) + '\n')
+        f.write(','.join(row) + '\n')
 
 
 def align_to_next_timeframe(timeframe='5m'):
     now = datetime.now(timezone.utc)
-    minutes = (now.minute // 5) * 5
-    # compute next 5m boundary
     next_min = ((now.minute // 5) + 1) * 5
     if next_min >= 60:
-        # next hour
         next_dt = now.replace(minute=0, second=0, microsecond=0) + pd.Timedelta(hours=1)
     else:
         next_dt = now.replace(minute=next_min, second=0, microsecond=0)
@@ -180,61 +344,97 @@ def align_to_next_timeframe(timeframe='5m'):
     return wait_seconds
 
 
-def main():
-    print(f"Starting BTC 5m prediction bot on {EXCHANGE_NAME} {SYMBOL}")
-    exchange = open_exchange(EXCHANGE_NAME)
+def run_live(exchange_name, symbol):
+    print(f"Starting live BTC 5m prediction on {exchange_name} {symbol}")
+    exchange = open_exchange(exchange_name)
 
-    # Warm up: fetch historic candles
-    try:
-        df = fetch_ohlcv(exchange, SYMBOL)
-    except Exception as e:
-        print("Error fetching initial OHLCV:", e)
-        return
+    model = load_model()
+    if model:
+        print("Loaded trained model from disk")
+    else:
+        print("No trained model found - falling back to heuristic weights")
 
     while True:
         try:
-            # align so predictions are made right after a closed 5m candle
             wait = align_to_next_timeframe(TIMEFRAME)
             print(f"Waiting {int(wait)}s until next 5m boundary...")
             time.sleep(max(1, wait))
 
-            df = fetch_ohlcv(exchange, SYMBOL)
-            orderbook = fetch_orderbook(exchange, SYMBOL)
-
-            # fetch trades in last few minutes
+            df = fetch_ohlcv(exchange, symbol, limit=200)
+            orderbook = fetch_orderbook(exchange, symbol)
             since_ms = int((datetime.now(timezone.utc).timestamp() - TRADE_LOOKBACK_SECONDS) * 1000)
-            trades = fetch_recent_trades(exchange, SYMBOL, since=since_ms)
+            trades = fetch_recent_trades(exchange, symbol, since=since_ms)
 
-            features = compute_features(df, orderbook, trades)
-            prob, score = predict_probability(features)
+            features = compute_features(df, orderbook=orderbook, trades=trades)
+            prob, score = predict_probability(features, model=model)
 
-            # print readable info
             now = datetime.now().astimezone()
             print("-------------------------------------------------------------")
-            print(now.isoformat(), f"Prediction next {TIMEFRAME} candle will CLOSE GREEN: {prob*100:.2f}%")
+            print(now.isoformat(), f"Prediction next {TIMEFRAME} candle CLOSE GREEN: {prob*100:.2f}%")
             print(f"Raw score: {score:.4f}")
-            print("Features:")
-            print(f" last_return: {features[0]:.6f}")
-            print(f" recent_3c_return: {features[1]:.6f}")
-            print(f" ema_slope: {features[2]:.6f}")
-            print(f" rsi_norm: {features[3]:.6f}")
-            print(f" orderbook_imb: {features[4]:.6f}")
-            print(f" trade_imb: {features[5]:.6f}")
-            print(f" vol_spike: {features[6]:.6f}")
+            for i, v in enumerate(features):
+                print(f" f{i}: {v:.6f}")
             print("-------------------------------------------------------------")
 
-            # optionally: persist predictions or send to webhook, exchange, or UI here
+            # log for future analysis
+            log_prediction(now, features, prob, model_name='trained' if model else 'heuristic')
 
-            # sleep a bit to avoid immediate re-fetching, loop will re-align at top
+            # sleep a short while before re-aligning
             time.sleep(2)
 
         except KeyboardInterrupt:
             print("Stopping by user")
             break
         except Exception as e:
-            print("Error in main loop:", e)
-            # backoff for a little while on errors
-            time.sleep(10)
+            print("Error in live loop:", e)
+            time.sleep(5)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true', help='Train model from historical OHLCV')
+    parser.add_argument('--backtest', action='store_true', help='Backtest saved model on historical OHLCV')
+    parser.add_argument('--live', action='store_true', help='Run live prediction (default)')
+    parser.add_argument('--exchange', default=EXCHANGE_NAME)
+    parser.add_argument('--symbol', default=SYMBOL)
+    args = parser.parse_args()
+
+    exchange = open_exchange(args.exchange)
+
+    if args.train:
+        print("Fetching historical OHLCV for training...")
+        df = fetch_ohlcv(exchange, args.symbol, limit=OHLCV_LIMIT)
+        X, y = build_dataset_from_ohlcv(df)
+        print(f"Built dataset X={X.shape} y={y.shape}")
+        # split
+        split = int(len(y) * 0.8)
+        Xtr, ytr = X[:split], y[:split]
+        Xval, yval = X[split:], y[split:]
+
+        w, b, mean, std = train_logistic_gd(Xtr, ytr, epochs=1200, lr=0.2, l2=1e-4, verbose=True)
+        save_model(w, b, mean, std)
+        print("Saved model to", MODEL_PATH)
+
+        model = load_model()
+        if model:
+            print("Evaluating on validation set...")
+            backtest_model(model, Xval, yval)
+
+    elif args.backtest:
+        model = load_model()
+        if not model:
+            print("No model found. Run --train first")
+            return
+        df = fetch_ohlcv(exchange, args.symbol, limit=OHLCV_LIMIT)
+        X, y = build_dataset_from_ohlcv(df)
+        # use last 20% as test
+        split = int(len(y) * 0.8)
+        Xval, yval = X[split:], y[split:]
+        backtest_model(model, Xval, yval)
+
+    else:
+        # default live
+        run_live(args.exchange, args.symbol)
 
 
 if __name__ == '__main__':
