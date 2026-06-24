@@ -1,5 +1,16 @@
-ccxt
+# Run-time defaults tuned for PaaS environments like Render
+# These settings prefer REST polling and 60s polling interval, and make websocket optional
+# via the REALTIME_USE_WS environment variable.
+
+# Default requirements
 pandas
 numpy
-scikit-learn
-ta
+ccxt
+fastapi
+uvicorn
+websocket-client
+
+# Optional (for training/backtesting):
+# lightgbm
+# scikit-learn
+# optuna
